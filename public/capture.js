@@ -14,11 +14,11 @@ export class Capture extends EventTarget {
   constructor(stream,{codec='auto',bitrate='auto',write,onError=()=>{}}){super();this.stream=stream;this.mime=chooseMime(codec);const s=stream.getVideoTracks()[0].getSettings();this.settings=s;this.bitrate=bitrate==='auto'?Math.round(Math.min(120e6,Math.max(8e6,(s.width??1920)*(s.height??1080)*(s.frameRate??30)*.22))):Number(bitrate)*1e6;this.write=write;this.onError=onError;this.queue=Promise.resolve();this.queued=0;this.bytes=0;this.failed=false;this.recorder=new MediaRecorder(stream,{mimeType:this.mime,videoBitsPerSecond:this.bitrate,audioBitsPerSecond:256000});
     this.done=new Promise(resolve=>this.resolveDone=resolve);
     this.recorder.addEventListener('dataavailable',e=>{const blob=e.data;if(!blob.size)return;if(this.queued+blob.size>MAX_QUEUE){this.fail(Error('書き込みが追いつかないため収録を停止しました。'));return;}this.queued+=blob.size;this.queue=this.queue.then(async()=>{try{if(!this.failed){for(let i=0;i<blob.size;i+=64*1024)await this.write(blob.slice(i,i+64*1024));this.bytes+=blob.size;}}catch(e){this.fail(e);}finally{this.queued-=blob.size;}});});
-    this.recorder.addEventListener('stop',()=>{this.queue.then(()=>this.resolveDone({bytes:this.bytes,failed:this.failed}));},{once:true});
+    this.recorder.addEventListener('stop',()=>{this.queue.then(()=>{this.complete=true;this.resolveDone({bytes:this.bytes,failed:this.failed});});},{once:true});
     this.recorder.addEventListener('error',e=>this.fail(e.error??Error('録画を停止しました。')));
     for(const t of stream.getTracks())t.addEventListener('ended',()=>this.fail(Error('カメラとの接続が切れました。')),{once:true});
   }
-  fail(e){if(this.failed)return;this.failed=true;this.onError(e);if(this.recorder.state!=='inactive')this.recorder.stop();else this.resolveDone({bytes:this.bytes,failed:true});}
+  fail(e){if(this.failed||this.complete)return;this.failed=true;this.onError(e);if(this.recorder.state!=='inactive')this.recorder.stop();else this.resolveDone({bytes:this.bytes,failed:true});}
   start(){this.startedAt=Date.now();this.recorder.start(500);}
-  async stop(){if(!this.startedAt)return {bytes:0,failed:this.failed};if(this.recorder.state!=='inactive')this.recorder.stop();return this.done;}
+  async stop(){if(!this.startedAt){this.complete=true;return {bytes:0,failed:this.failed};}if(this.recorder.state!=='inactive')this.recorder.stop();return this.done;}
 }
