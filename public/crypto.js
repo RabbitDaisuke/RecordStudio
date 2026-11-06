@@ -1,0 +1,18 @@
+const te = new TextEncoder();
+const td = new TextDecoder('utf-8', { fatal: true });
+export const utf8 = s => te.encode(s);
+export const text = b => td.decode(b);
+export const random = n => crypto.getRandomValues(new Uint8Array(n));
+export function join(...parts) { const b = new Uint8Array(parts.reduce((n,p)=>n+p.length,0)); let i=0; for(const p of parts){b.set(p,i);i+=p.length;} return b; }
+export function b64(b) { let s=''; for(const n of b)s+=String.fromCharCode(n); return btoa(s).replaceAll('+','-').replaceAll('/','_').replace(/=+$/,''); }
+export function un64(s) { if(!/^[A-Za-z0-9_-]*$/.test(s))throw Error('接続情報を確認してください。'); return Uint8Array.from(atob(s.replaceAll('-','+').replaceAll('_','/')), c=>c.charCodeAt(0)); }
+export async function mac(key, data) { const k=await crypto.subtle.importKey('raw',key,{name:'HMAC',hash:'SHA-256'},false,['sign']); return new Uint8Array(await crypto.subtle.sign('HMAC',k,data)); }
+export async function equalProof(key, data, proof) { const k=await crypto.subtle.importKey('raw',key,{name:'HMAC',hash:'SHA-256'},false,['verify']); return crypto.subtle.verify('HMAC',k,un64(proof),data); }
+export async function derive(key,salt,info,n=32) { const k=await crypto.subtle.importKey('raw',key,'HKDF',false,['deriveBits']); return new Uint8Array(await crypto.subtle.deriveBits({name:'HKDF',hash:'SHA-256',salt,info:utf8(info)},k,n*8)); }
+const WRAP = Uint8Array.from('7f4b44d58e50e4b0de47d486bb11e16af31d8a78f4bbcd221ffb6b349911929a'.match(/../g), x=>parseInt(x,16));
+export async function wrapPair(pair) { const iv=random(12), k=await crypto.subtle.importKey('raw',WRAP,'AES-GCM',false,['encrypt']); const data=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:utf8('RSKEY1')},k,utf8(JSON.stringify(pair)))); return b64(join(iv,data)); }
+export async function unwrapPair(s) { const bytes=un64(s),k=await crypto.subtle.importKey('raw',WRAP,'AES-GCM',false,['decrypt']); return JSON.parse(text(await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(0,12),additionalData:utf8('RSKEY1')},k,bytes.slice(12)))); }
+export async function sessionKeys(enc,cn,sn) { const salt=join(cn,sn); return {send:await derive(enc,salt,'recordstudio/v1/c2s/key'),receive:await derive(enc,salt,'recordstudio/v1/s2c/key'),sendPrefix:await derive(enc,salt,'recordstudio/v1/c2s/nonce',4),receivePrefix:await derive(enc,salt,'recordstudio/v1/s2c/nonce',4)}; }
+export function proofData(role,cn,sn,label) { return join(utf8('recordstudio/v1/'+label+'\n'+role+'\n'),cn,sn); }
+export async function seal(key,prefix,seq,payload) { const header=new Uint8Array(12); header[0]=1;new DataView(header.buffer).setBigUint64(4,BigInt(seq));const iv=join(prefix,header.slice(4));const k=await crypto.subtle.importKey('raw',key,'AES-GCM',false,['encrypt']);return b64(join(header,new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:header},k,utf8(JSON.stringify(payload)))))); }
+export async function open(key,prefix,seq,encoded) { const frame=un64(encoded),header=frame.slice(0,12);if(frame.length<28||header[0]!==1||header[1]||header[2]||header[3]||new DataView(header.buffer).getBigUint64(4)!==BigInt(seq))throw Error('暗号化通信の順序が一致しません。再接続してください。');const k=await crypto.subtle.importKey('raw',key,'AES-GCM',false,['decrypt']);return JSON.parse(text(await crypto.subtle.decrypt({name:'AES-GCM',iv:join(prefix,header.slice(4)),additionalData:header},k,frame.slice(12)))); }

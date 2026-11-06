@@ -1,0 +1,6 @@
+{
+  "port": 9443,
+  "appUrl": "https://rabbitdaisuke.github.io/RecordStudio/",
+  "cloudflared": "cloudflared",
+  "iceServers": []
+}

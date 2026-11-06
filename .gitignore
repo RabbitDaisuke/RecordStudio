@@ -1,0 +1,8 @@
+dist/
+.runtime/
+ip.txt
+config.json
+*.log
+*.zip
+.openai/*
+!.openai/hosting.json

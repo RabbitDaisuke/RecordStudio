@@ -1,0 +1,11 @@
+import { random,b64,un64,mac,equalProof,sessionKeys,proofData,seal,open,unwrapPair } from './crypto.js';
+export async function parseInvitation(value){let s=value.trim();if(s.includes('#'))s=new URL(s).hash.slice(1);if(s.startsWith('pair='))s=s.slice(5);const p=await unwrapPair(s);const u=new URL(p.u);if(p.v!==1||!['receiver','sender'].includes(p.r)||u.protocol!=='https:'||u.username||u.password||u.search||u.hash||!/^\/[a-f0-9]{128}$/.test(u.pathname)||un64(p.a).length!==32||un64(p.e).length!==32)throw Error('接続情報を確認してください。');return p;}
+export class Signal extends EventTarget {
+  constructor(pair){super();this.pair=pair;this.cn=random(32);this.rx=0;this.tx=0;this.queue=Promise.resolve();this.closed=false;}
+  async post(path,data){const r=await fetch(`${this.pair.u}/${path}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data),cache:'no-store',credentials:'omit',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(12000)});if(!r.ok)throw Error('接続先を確認してください。');return r.json();}
+  async connect(){const p=this.pair,h=await this.post('hello',{role:p.r,cn:b64(this.cn)}),sn=un64(h.sn);if(sn.length!==32||!await equalProof(un64(p.a),proofData(p.r,this.cn,sn,'server'),h.proof))throw Error('接続先を認証できませんでした。');this.id=h.id;this.k=await sessionKeys(un64(p.e),this.cn,sn);const a=await this.post('auth',{id:h.id,proof:b64(await mac(un64(p.a),proofData(p.r,this.cn,sn,'client')))});const cfg=await open(this.k.receive,this.k.receivePrefix,this.rx++,a.frame);this.iceServers=cfg.iceServers;this.poll();return cfg;}
+  rpc(data){const task=this.queue.then(async()=>{if(this.closed)throw Error('接続が終了しました。');const frame=await seal(this.k.send,this.k.sendPrefix,this.tx++,data);const result=await this.post('rpc',{id:this.id,frame});return open(this.k.receive,this.k.receivePrefix,this.rx++,result.frame);});this.queue=task.catch(()=>{});return task;}
+  send(to,data){return this.rpc({type:'signal',to,data});}
+  async poll(){while(!this.closed){try{const r=await this.rpc({type:'poll'});for(const e of r.events)this.dispatchEvent(new CustomEvent('event',{detail:e}));}catch(e){if(!this.closed){this.closed=true;this.dispatchEvent(new CustomEvent('error',{detail:e}));}break;}await new Promise(r=>setTimeout(r,350));}}
+  async close(){if(this.closed)return;try{await this.rpc({type:'leave'});}finally{this.closed=true;}}
+}

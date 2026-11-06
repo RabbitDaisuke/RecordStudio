@@ -1,0 +1,103 @@
+import { Signal,parseInvitation } from './signal.js';
+import { Peer } from './peer.js';
+import { Storage,LivePreview,downloadFile } from './storage.js';
+import { Capture,openCamera,stamp } from './capture.js';
+import { drawQr } from './qr.js';
+const $=s=>document.querySelector(s),delay=ms=>new Promise(r=>setTimeout(r,Math.max(0,ms)));
+const size=n=>{if(!n)return '0 B';const i=Math.min(3,Math.floor(Math.log(n)/Math.log(1024)));return `${(n/1024**i).toFixed(i?1:0)} ${['B','KB','MB','GB'][i]}`;};
+const elapsed=ms=>{const s=Math.max(0,Math.floor(ms/1000));return [Math.floor(s/3600),Math.floor(s/60)%60,s%60].map(x=>String(x).padStart(2,'0')).join(':');};
+const clean=s=>String(s).replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,60);
+class Studio {
+  constructor(){this.mode='receiver';this.slots=[];this.peers=new Map();this.storage=new Storage();this.phase='idle';this.events=[];this.sequence=0;this.selectedDevice=null;this.storage.addEventListener('saved',e=>this.saved(e.detail));this.bind();this.tick=setInterval(()=>this.update(),500);this.log('収録画面を開きました。');window.addEventListener('beforeunload',e=>{if(this.phase!=='idle'){e.preventDefault();e.returnValue='';}});}
+  log(message,error=false){this.events.push({at:new Date().toISOString(),message,error});if(this.events.length>200)this.events.shift();const li=document.createElement('li');li.textContent=`${new Date().toLocaleTimeString('ja-JP')}　${message}`;if(error)li.className='error';$('#event-log').prepend(li);while($('#event-log').children.length>30)$('#event-log').lastChild.remove();}
+  notice(message,error=false){$('#notice').hidden=false;$('#notice').textContent=message;$('#notice').classList.toggle('error',error);this.log(message,error);}
+  options(){return {quality:$('#quality').value,fps:$('#fps').value,codec:$('#codec').value,bitrate:$('#bitrate').value,audio:$('#audio').checked};}
+  bind(){
+    $('#add-camera').onclick=$('#empty-add').onclick=()=>this.selectCamera();
+    $('#refresh-cameras').onclick=()=>this.selectCamera();
+    $('#device-dialog').addEventListener('close',()=>{if($('#device-dialog').returnValue==='add')this.addLocal($('#device-select').value).catch(e=>this.notice(this.cameraError(e),true));});
+    for(const id of ['#connection-button','#empty-connect'])$(id).onclick=()=>$('#connect-dialog').showModal();
+    $('#close-connect').onclick=()=>$('#connect-dialog').close();
+    $('#connect').onclick=()=>this.connect($('#invitation').value).then(()=>{$('#invitation').value='';$('#connect-dialog').close();}).catch(e=>this.notice(e.message,true));
+    $('#choose-folder').onclick=()=>$('#folder-dialog').showModal();$('#close-folder').onclick=()=>$('#folder-dialog').close();
+    $('#directory').onclick=async()=>{try{const name=await this.storage.choose();$('#destination-label').textContent=name;$('#folder-dialog').close();this.log(`保存先を「${name}」に変更しました。`);}catch(e){if(e.name!=='AbortError')this.notice(e.message,true);}};
+    $('#browser-storage').onclick=async()=>{try{$('#destination-label').textContent=await this.storage.useBrowser();$('#folder-dialog').close();}catch(e){this.notice(e.message,true);}};
+    $('#record').onclick=()=>this.start().catch(e=>this.notice(e.message,true));$('#stop').onclick=()=>this.stop();
+    $('#recover').onclick=()=>this.recover();$('#export-log').onclick=()=>downloadFile(new File([JSON.stringify({version:1,events:this.events,cameras:this.slots.map(s=>({name:s.name,settings:s.settings,state:s.state})),userAgent:navigator.userAgent},null,2)],`RecordStudio-${stamp()}-diagnostics.json`,{type:'application/json'}));
+    $('#copy-invitation').onclick=()=>navigator.clipboard.writeText(this.senderUrl).then(()=>this.notice('接続URLをコピーしました。')).catch(e=>this.notice(e.message,true));
+  }
+  cameraError(e){return {NotAllowedError:'カメラの使用を許可して、もう一度追加してください。',NotFoundError:'カメラを接続して「再検出」を押してください。',NotReadableError:'カメラを使用中のアプリを閉じて、もう一度追加してください。',OverconstrainedError:'画質またはフレームレートを変更して追加してください。'}[e.name]??e.message;}
+  async selectCamera(){if(this.phase!=='idle')return;if(this.slots.length>=(this.mode==='sender'?1:5)){this.notice(this.mode==='sender'?'この端末のカメラは接続済みです。':'カメラは最大5台です。');return;}try{
+    let devices=await navigator.mediaDevices.enumerateDevices();if(!devices.some(d=>d.kind==='videoinput'&&d.label)){const s=await navigator.mediaDevices.getUserMedia({video:true,audio:false});try{devices=await navigator.mediaDevices.enumerateDevices();}finally{s.getTracks().forEach(t=>t.stop());}}
+    const available=devices.filter(d=>d.kind==='videoinput'&&!this.slots.some(s=>s.local&&s.settings?.deviceId===d.deviceId));
+    if(!available.length)throw Error('追加できるカメラがありません。接続を確認してください。');const select=$('#device-select');select.replaceChildren();available.forEach((d,i)=>{const o=document.createElement('option');o.value=d.deviceId;o.textContent=d.label||`カメラ ${i+1}`;select.append(o);});$('#device-dialog').showModal();
+  }catch(e){this.notice(this.cameraError(e),true);}}
+  makeSlot(props){if(this.slots.length>=5)throw Error('カメラは最大5台です。');const s={id:++this.sequence,state:'ready',bytes:0,...props};const card=document.createElement('article');card.className='camera-card';card.innerHTML='<div class="video-wrap"><span class="video-placeholder">接続を確認しています</span><video muted playsinline autoplay></video><span class="camera-state">準備完了</span><span class="camera-number"></span></div><div class="camera-info"><div class="camera-title-row"><span class="camera-title"></span><button class="remove" aria-label="カメラを外す">×</button></div><div class="camera-spec"></div><div class="camera-progress"></div></div>';s.el=card;s.video=card.querySelector('video');card.querySelector('.camera-number').textContent=String(s.id).padStart(2,'0');card.querySelector('.remove').onclick=()=>this.removeSlot(s);this.slots.push(s);if(this.slots.length===1)$('#camera-grid').replaceChildren();$('#camera-grid').append(card);this.renderSlot(s);this.update();return s;}
+  async addLocal(deviceId){if(this.phase!=='idle')return;const o=this.options(),stream=await openCamera(deviceId,o.quality,o.fps,o.audio);let s;try{s=this.makeSlot({local:true,stream,name:stream.getVideoTracks()[0].label||'カメラ',settings:stream.getVideoTracks()[0].getSettings()});}catch(e){stream.getTracks().forEach(t=>t.stop());throw e;}s.video.srcObject=stream;s.video.classList.add('playing');s.video.play().catch(()=>{});s.el.querySelector('.video-placeholder').hidden=true;stream.getVideoTracks()[0].addEventListener('ended',()=>{s.state='fault';this.renderSlot(s);if(this.phase==='recording')this.stop('カメラとの接続が切れました。');},{once:true});this.log(`カメラを追加しました: ${s.name}`);if(this.mode==='sender')for(const p of this.peers.values())this.describe(p,s);}
+  removeSlot(s){if(this.phase!=='idle')return;s.stream?.getTracks().forEach(t=>t.stop());s.preview?.destroy();if(s.peer)s.peer.close();s.el.remove();this.slots=this.slots.filter(x=>x!==s);this.update();if(!this.slots.length){const b=document.createElement('button');b.className='add-tile';b.innerHTML='<span class="camera-icon">＋</span><strong>カメラを追加</strong>';b.onclick=()=>this.selectCamera();$('#camera-grid').append(b);}if(this.mode==='sender')for(const p of this.peers.values())p.send({type:'camera-removed'});}
+  describe(p,s){p.send({type:'camera',name:s.name,settings:s.settings});}
+  renderSlot(s){s.el.querySelector('.camera-title').textContent=s.name;s.el.querySelector('.camera-spec').textContent=s.settings?`${s.settings.width??'—'} × ${s.settings.height??'—'} ・ ${Math.round(s.settings.frameRate??0)} fps${s.local?' ・ このPC':' ・ 別端末'}`:'カメラの選択を待っています';const badge=s.el.querySelector('.camera-state');badge.textContent={ready:'準備完了',waiting:'カメラ待機中',recording:'収録中',saving:'保存中',saved:'保存済み',fault:'停止'}[s.state]??s.state;badge.classList.toggle('recording',s.state==='recording');s.el.querySelector('.remove').disabled=this.phase!=='idle';}
+  async connect(value){if(this.phase!=='idle')throw Error('収録を停止してから接続してください。');const pair=await parseInvitation(value);if(this.signal)await this.signal.close();for(const p of this.peers.values())p.close();this.peers.clear();this.mode=pair.r;document.body.classList.toggle('sender',pair.r==='sender');if(pair.r==='sender'){$('#page-title').textContent='このカメラから、収録へ。';$('#page-description').textContent='カメラを選んで、PCからの収録開始を待ってください。';$('#eyebrow').textContent='CAMERA CONNECTION';$('#connection-button').textContent='接続情報';$('#add-camera').textContent='カメラを選ぶ';}
+    const signal=new Signal(pair);this.signal=signal;signal.addEventListener('event',e=>this.signalEvent(e.detail));signal.addEventListener('error',e=>{this.notice('接続が切れました。認証ページのURLから接続し直してください。',true);if(this.phase==='recording')this.stop('接続が切れたため収録を停止しました。');$('#connection-state').textContent='切断';});const cfg=await signal.connect();if(cfg.senderUrl){this.senderUrl=cfg.senderUrl;drawQr($('#invite-qr'),cfg.senderUrl);$('#invite-qr-wrap').hidden=false;}$('#connection-state').textContent='暗号化接続済み';$('#connection-state').classList.add('connected');this.log('接続先の認証と暗号化接続が完了しました。');this.update();return cfg;
+  }
+  signalEvent(e){try{if(e.type==='joined'){if(this.peers.has(e.id))return;if(this.mode==='receiver'&&this.slots.length>=5){this.notice('接続済みのカメラは5台です。');return;}const p=new Peer(this.signal,e.id,this.mode==='receiver');this.peers.set(e.id,p);p.onControl=m=>this.control(p,m);p.addEventListener('error',e=>this.notice(e.detail.message,true));p.addEventListener('open',()=>{this.log('カメラ端末と直接接続しました。');if(this.mode==='sender'&&this.slots[0])this.describe(p,this.slots[0]);if(this.mode==='receiver')p.syncClock().then(()=>this.log(`カメラの時刻を合わせました (${p.rtt} ms)。`)).catch(e=>this.notice(e.message,true));this.update();});p.addEventListener('close',()=>this.peerClosed(p));if(this.mode==='receiver')p.slot=this.makeSlot({local:false,peer:p,name:'カメラ端末',state:'waiting'});}
+    if(e.type==='signal'){const p=this.peers.get(e.from);if(p)p.signalMessage(e.data).catch(e=>this.notice(e.message,true));}
+    if(e.type==='left')this.peers.get(e.id)?.close();
+  }catch(e){this.notice(e.message,true);}}
+  async control(p,m){try{
+    if(this.mode==='receiver'){
+      const s=p.slot;if(!s)return;
+      if(m.type==='camera'){s.name=String(m.name??'カメラ端末').slice(0,100);s.settings=m.settings;s.state='ready';s.el.querySelector('.video-placeholder').textContent='収録開始を待っています';this.renderSlot(s);this.update();}
+      if(m.type==='camera-removed'){s.state='waiting';s.settings=null;this.renderSlot(s);this.update();}
+      if(m.type==='fatal'){s.state='fault';this.renderSlot(s);this.notice(String(m.message).slice(0,200),true);if(this.phase!=='idle')this.stop('カメラが停止したため収録を終了しました。');}
+      return;
+    }
+    const s=this.slots[0];
+    if(m.type==='prepare'){
+      if(!s?.stream||this.phase!=='idle')throw Error('カメラを選んでください。');this.phase='preparing';this.take=m.take;const opt=this.options();s.capture=new Capture(s.stream,{...opt,write:blob=>p.write(blob),onError:e=>{this.notice(e.message,true);try{p.send({type:'fatal',message:e.message});}catch{}}});p.reply(m,{mime:s.capture.mime,settings:s.capture.settings,bitrate:s.capture.bitrate});this.update();return;
+    }
+    if(m.type==='start'){
+      if(!s?.capture||m.take!==this.take)throw Error('収録の準備をやり直してください。');if(!Number.isFinite(m.at)||Math.abs(m.at-Date.now())>15000)throw Error('端末の時刻を確認してください。');await delay(m.at-Date.now());s.capture.start();this.startedAt=s.capture.startedAt;this.phase='recording';s.state='recording';this.wake();this.renderSlot(s);p.reply(m,{actualAt:this.startedAt});this.log('収録を開始しました。');return;
+    }
+    if(m.type==='stop'){
+      if(m.take!==this.take){p.reply(m,{bytes:0,failed:true});return;}this.phase='saving';const result=await s.capture.stop();await p.drain();s.state=result.failed?'fault':'saved';this.phase='idle';this.releaseWake();this.renderSlot(s);p.reply(m,{...result,actualAt:s.capture.startedAt});this.log('収録データを送信しました。');this.update();return;
+    }
+    if(m.type==='cancel'){await s?.capture?.stop();this.phase='idle';this.releaseWake();p.reply(m);this.update();}
+  }catch(e){if(m.request)p.reply(m,{error:e.message});else throw e;}}
+  peerClosed(p){if(p.slot){p.slot.state='fault';this.renderSlot(p.slot);}this.peers.delete(p.id);if(this.phase!=='idle'){this.notice('カメラ端末との接続が切れました。',true);if(this.mode==='sender'){this.slots[0]?.capture?.stop().finally(()=>{this.phase='idle';this.releaseWake();this.update();});}else this.stop('カメラ端末との接続が切れました。');}this.update();}
+  async wake(){try{this.wakeLock=await navigator.wakeLock?.request('screen');}catch{}}
+  releaseWake(){this.wakeLock?.release().catch(()=>{});this.wakeLock=null;}
+  async start(){if(this.phase!=='idle'||this.mode!=='receiver')return;const slots=this.slots.filter(s=>s.state!=='fault'&&s.settings&&(s.local||s.peer?.channel?.readyState==='open'));if(!slots.length)throw Error('カメラを追加してください。');this.phase='preparing';this.take=`RS_${stamp()}_${crypto.randomUUID().slice(0,6)}`;this.activeSlots=slots;this.takeInfo={version:1,take:this.take,requestedAt:new Date().toISOString(),cameras:[],status:'preparing'};$('#notice').hidden=true;this.update();
+    try{
+      if(!this.storage.directory)await this.storage.useBrowser();await this.storage.metadata(`${this.take}_started.json`,this.takeInfo);
+      await Promise.all(slots.map(async(s,i)=>{
+        let info;if(s.local){s.capture=new Capture(s.stream,{...this.options(),write:blob=>s.sink.write(blob),onError:e=>{this.notice(e.message,true);this.stop(e.message);}});info={mime:s.capture.mime,settings:s.capture.settings,bitrate:s.capture.bitrate};}else{await s.peer.syncClock();info=await s.peer.request('prepare',{take:this.take});}
+        s.bytes=0;s.startBytes=s.peer?.received??0;s.mime=info.mime;s.sink=await this.storage.create(`${this.take}_C${String(i+1).padStart(2,'0')}.${info.mime.includes('mp4')?'mp4':'webm'}`,info.mime);s.failed=false;
+        s.info={camera:i+1,name:s.name,local:s.local,filename:s.sink.file.name,mime:info.mime,settings:info.settings,requestedBitrate:info.bitrate,clockOffsetMs:s.peer?.offset??0,clockRoundTripMs:s.peer?.rtt??0};this.takeInfo.cameras.push(s.info);
+        if(!s.local){s.preview?.destroy();s.preview=new LivePreview(s.video,info.mime);s.video.classList.add('playing');s.peer.onBytes=async bytes=>{await s.sink.write(bytes);s.preview.append(bytes);s.bytes=s.sink.file.bytes;};}
+      }));
+      const at=Date.now()+Math.max(1500,...slots.map(s=>(s.peer?.rtt??0)*3));this.startedAt=at;this.takeInfo.scheduledAt=new Date(at).toISOString();this.phase='recording';this.wake();this.update();
+      await Promise.all(slots.map(async s=>{s.state='recording';this.renderSlot(s);if(s.local){await delay(at-Date.now());if(this.phase!=='recording')return;s.capture.start();s.info.actualStartAt=s.capture.startedAt;}else{const r=await s.peer.request('start',{take:this.take,at:at+s.peer.offset});s.info.actualStartAt=r.actualAt;s.info.actualStartOnReceiverClock=r.actualAt-s.peer.offset;}}));this.log(`${slots.length}台の収録を開始しました。`);
+    }catch(e){this.notice(e.message,true);await this.stop(e.message);}
+  }
+  async stop(reason){if(this.phase==='idle'||this.stopping)return this.stopping;this.stopping=this.finish(reason).finally(()=>{this.stopping=null;});return this.stopping;}
+  async finish(reason){this.phase='saving';this.update();const slots=this.activeSlots??[];const results=await Promise.allSettled(slots.map(async s=>{s.state='saving';this.renderSlot(s);let result={failed:true};try{
+      if(s.local)result=await s.capture?.stop()??result;
+      else if(s.peer&&!s.peer.closed){result=await s.peer.request('stop',{take:this.take},30000);if(result.bytes!==(s.sink?.file.bytes??0))throw Error('送信量と保存量が一致しません。');}
+      s.failed=!!result.failed||!!reason;if(s.info){s.info.bytes=s.sink?.file.bytes??0;s.info.status=s.failed?'incomplete':'complete';s.info.actualStopAt=Date.now();}await s.sink?.close(s.failed);s.state=s.failed?'fault':'saved';
+    }catch(e){s.failed=true;s.state='fault';if(s.info){s.info.status='incomplete';s.info.error=e.message;s.info.bytes=s.sink?.file.bytes??0;}await s.sink?.close(true);throw e;}finally{s.preview?.destroy();if(s.peer)s.peer.onBytes=null;this.renderSlot(s);}}));
+    if(this.takeInfo){this.takeInfo.finishedAt=new Date().toISOString();this.takeInfo.status=reason||results.some(r=>r.status==='rejected')||slots.some(s=>s.failed)?'incomplete':'complete';this.takeInfo.reason=reason??null;this.takeInfo.cameras.sort((a,b)=>a.camera-b.camera);try{await this.storage.metadata(`${this.take}_session.json`,this.takeInfo);}catch(e){this.notice(`収録情報を保存できませんでした: ${e.message}`,true);}}
+    this.phase='idle';this.releaseWake();this.update();if(reason)this.notice(reason,true);else this.notice(this.takeInfo?.status==='complete'?'収録ファイルを保存しました。':'保存できたファイルを確認してください。',this.takeInfo?.status!=='complete');
+  }
+  saved(file){if(file.mime==='application/json')return;const row=document.createElement('div');row.className='file-row';const info=document.createElement('div'),name=document.createElement('div'),meta=document.createElement('small');name.className='filename';name.textContent=file.name;meta.textContent=`${size(file.bytes)} ・ ${file.failed?'途中まで保存':'保存済み'}`;info.append(name,meta);const b=document.createElement('button');b.className='text-button';b.textContent='ダウンロード';b.onclick=async()=>{try{downloadFile(await file.sink.getFile());}catch(e){this.notice(e.message,true);}};row.append(info,b);$('#recordings .empty-message')?.remove();$('#recordings').prepend(row);}
+  async recover(){try{const files=await this.storage.recovery();if(!files.length){this.notice('ブラウザ内に保存したファイルはありません。');return;}$('#recordings').replaceChildren();for(const file of files){if(!/\.(mp4|webm)$/.test(file.name))continue;this.saved({...file,mime:'video',closed:true,sink:{getFile:()=>file.handle.getFile()}});}this.notice('ブラウザ内の収録ファイルを開きました。');}catch(e){this.notice(e.message,true);}}
+  update(){const count=this.slots.filter(s=>s.state!=='fault').length;$('#camera-count').innerHTML=`${count}<span> / 5</span>`;const idle=this.phase==='idle';$('#record').disabled=!idle||!this.slots.some(s=>s.settings&&s.state!=='fault');$('#record').hidden=!idle;$('#stop').hidden=idle;$('#stop').disabled=this.phase==='saving'||this.phase==='preparing';$('#stop').textContent=this.phase==='saving'?'保存しています…':this.phase==='preparing'?'準備しています…':'■ 収録を停止';$('#add-camera').disabled=!idle||this.slots.length>=(this.mode==='sender'?1:5);$('#choose-folder').disabled=!idle;$('#refresh-cameras').disabled=!idle;for(const e of document.querySelectorAll('.capture-settings input,.capture-settings select'))e.disabled=!idle;for(const s of this.slots)s.el.querySelector('.remove').disabled=!idle;
+    if(this.startedAt)$('#timer').textContent=elapsed((idle?this.stoppedAt??Date.now():Date.now())-this.startedAt);if(!idle)this.stoppedAt=Date.now();
+    let total=0,queued=0;for(const s of this.slots){total+=s.sink?.file.bytes??s.capture?.bytes??0;queued+=s.capture?.queued??0;const bytes=s.sink?.file.bytes??s.capture?.bytes??0;s.el.querySelector('.camera-progress').textContent=bytes?`${size(bytes)}${s.capture?.queued?` ・ 待ち ${size(s.capture.queued)}`:''}`:s.local?'':s.peer?.channel?.readyState==='open'?'接続済み':'接続中';}
+    $('#total-size').textContent=size(total);$('#diag-saved').textContent=size(this.storage.total);$('#diag-queue').textContent=size(queued);$('#diag-connection').textContent=this.signal&&!this.signal.closed?'暗号化接続':'ローカル';$('#health').textContent={idle:'待機中',preparing:'準備中',recording:'収録中',saving:'保存中'}[this.phase];
+    $('#diagnostic-cameras').replaceChildren();for(const s of this.slots){const d=document.createElement('div');d.className='diag-camera';const settings=s.settings??{};d.textContent=`${String(s.id).padStart(2,'0')} ${s.name} · ${settings.width??'—'}×${settings.height??'—'} / ${Math.round(settings.frameRate??0)} fps · ${s.capture?.mime??s.mime??'—'} · ${size(s.sink?.file.bytes??s.capture?.bytes??0)}${s.peer?` · 送信待ち ${size(s.peer.sent-s.peer.acked)} · RTT ${s.peer.rtt??'—'} ms`:''}`;$('#diagnostic-cameras').append(d);}
+  }
+}
+const studio=new Studio();window.recordStudio=studio;
+const initial=location.hash;if(initial.startsWith('#pair=')){history.replaceState(null,'',location.pathname+location.search);studio.connect(initial.slice(1)).catch(e=>studio.notice(e.message,true));}
+if(!window.isSecureContext||!navigator.mediaDevices)studio.notice('HTTPSでこの画面を開いてください。',true);
