@@ -2,11 +2,10 @@ import https from 'node:https';
 import { readFile, mkdir } from 'node:fs/promises';
 import { dirname, join as pathJoin } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { isIP } from 'node:net';
 import { localCertificate } from './server/tls.mjs';
-import {persistentAuthentication,installationKey} from './server/auth.mjs';
 import { b64, un64, mac, equalProof, random, sessionKeys, proofData, seal, open, wrapPair } from './public/crypto.js';
 
 const root=dirname(fileURLToPath(import.meta.url));
@@ -22,11 +21,14 @@ const appUrl=config.appUrl?new URL(config.appUrl):null;if(appUrl&&(appUrl.protoc
 const allowedOrigins=new Set(appUrl?[appUrl.origin]:[]);for(const o of config.allowedAppOrigins??[]){const u=new URL(o);if(u.protocol!=='https:'||u.origin!==o)throw Error('invalid allowedAppOrigins');allowedOrigins.add(o);}
 if(config.iceServers?.length)throw Error('この構成ではSTUN/TURNを使用しません。config.jsonのiceServersを空にしてください。');
 const iceServers=[];
-const authentication=await persistentAuthentication(pathJoin(root,'.runtime'));
-const token=authentication.token,adminToken=createHash('sha512').update(installationKey(authentication.seed,'local-admin')).digest('hex');
+const bootSeed=randomBytes(1024);
+const keySeed=createHash('sha256').update(bootSeed).digest();
+const token=createHash('sha512').update(bootSeed).update('recordstudio/signaling/v1','utf8').digest('hex');
+const adminToken=createHash('sha512').update(bootSeed).update('recordstudio/local-admin/v1','utf8').digest('hex');
 const tokenBytes=Buffer.from(token,'hex');
 const validUrlToken=value=>typeof value==='string'&&/^[a-f0-9]{128}$/.test(value)&&timingSafeEqual(Buffer.from(value,'hex'),tokenBytes);
-const keys=Object.fromEntries(['receiver','sender'].map(role=>[role,{a:installationKey(authentication.seed,role+'/auth'),e:installationKey(authentication.seed,role+'/encryption')}]));
+const roleKey=label=>createHmac('sha256',keySeed).update('recordstudio/boot/v1/'+label,'utf8').digest();
+const keys=Object.fromEntries(['receiver','sender'].map(role=>[role,{a:roleKey(role+'/auth'),e:roleKey(role+'/encryption')}]));
 const pending=new Map(),clients=new Map();let publicOrigin=null,tunnel=null,closing=false;
 const budgets=new Map();let globalWindow=Date.now(),globalRequests=0;
 function requester(req){const socketIP=req.socket.remoteAddress??'';const forwarded=req.headers['cf-connecting-ip'];return [host,'127.0.0.1','::1','::ffff:127.0.0.1'].includes(socketIP)&&typeof forwarded==='string'&&isIP(forwarded)?forwarded:socketIP;}
