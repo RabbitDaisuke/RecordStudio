@@ -4,6 +4,7 @@ import { dirname, join as pathJoin } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, timingSafeEqual, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { isIP } from 'node:net';
 import { localCertificate } from './server/tls.mjs';
 import { b64, un64, mac, equalProof, random, sessionKeys, proofData, seal, open, wrapPair } from './public/crypto.js';
 
@@ -13,8 +14,8 @@ const same=(a,b)=>{const x=Buffer.from(String(a)),y=Buffer.from(String(b));retur
 const decode32=s=>{const b=un64(String(s));if(b.length!==32)throw Error('invalid nonce');return b;};
 const configPath=pathJoin(root,'config.json');let config;
 try { config=JSON.parse(await readFile(configPath,'utf8')); } catch(e) { if(e.code==='ENOENT')config=JSON.parse(await readFile(pathJoin(root,'config.example.json'),'utf8'));else throw e; }
-let host;try {host=(await readFile(pathJoin(root,'ip.txt'),'utf8')).trim();}catch{throw Error('ip.txt がありません。ip.example.txt を ip.txt にコピーし、127.0.0.1 を指定してください。');}
-if(host!=='127.0.0.1')throw Error('ip.txt は UTF-8 の 127.0.0.1 一行にしてください。外部アドレスへの待受は拒否しました。');
+let host;try {host=(await readFile(pathJoin(root,'ip.txt'),'utf8')).trim();}catch{throw Error('ip.txt がありません。このPCの待受用IPv4アドレスをUTF-8で一行指定してください。');}
+if(isIP(host)!==4)throw Error('ip.txt に、このPCの待受用IPv4アドレスをUTF-8で一行指定してください。例: 192.168.1.10');
 const port=Number(config.port??9443);if(!Number.isInteger(port)||port<1024||port>65535)throw Error('invalid port');
 const appUrl=new URL(config.appUrl);if(appUrl.protocol!=='https:'||appUrl.username||appUrl.password||appUrl.hash)throw Error('config.appUrl must be HTTPS');
 const allowedOrigins=new Set([appUrl.origin]);for(const o of config.allowedAppOrigins??[]){const u=new URL(o);if(u.protocol!=='https:'||u.origin!==o)throw Error('invalid allowedAppOrigins');allowedOrigins.add(o);}
@@ -23,10 +24,11 @@ for(const s of iceServers){for(const u of [s.urls].flat()){if(typeof u!=='string
 const token=shaToken(),adminToken=shaToken();
 const keys={receiver:{a:random(32),e:random(32)},sender:{a:random(32),e:random(32)}};
 const pending=new Map(),clients=new Map();let publicOrigin=null,tunnel=null,closing=false;
-const tls=await localCertificate(pathJoin(root,'.runtime'));const adminPort=port+1;if(adminPort>65535)throw Error('port too high');
+const tunnelIp=host==='0.0.0.0'?'127.0.0.1':host;
+const tls=await localCertificate(pathJoin(root,'.runtime'),tunnelIp);const adminPort=port+1;if(adminPort>65535)throw Error('port too high');
 const localOrigin=`https://127.0.0.1:${adminPort}`;
 const headers={'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','Strict-Transport-Security':'max-age=31536000'};
-const urlFor=async role=>{if(!publicOrigin)return null;const pair={v:1,u:`${publicOrigin}/${token}`,a:b64(keys[role].a),e:b64(keys[role].e),r:role};const u=new URL(appUrl);u.hash='pair='+await wrapPair(pair);return u.href;};
+const urlFor=async role=>{if(!publicOrigin)return null;const pair={v:1,u:`${publicOrigin}/${token}`,a:b64(keys[role].a),e:b64(keys[role].e),r:role};const u=role==='sender'?new URL('camera.html',appUrl):new URL(appUrl);u.hash='pair='+await wrapPair(pair);return u.href;};
 function json(res,value,cors={}){const body=JSON.stringify(value);res.writeHead(200,{...headers,...cors,'Content-Type':'application/json;charset=utf-8','Content-Length':Buffer.byteLength(body)});res.end(body);}
 async function body(req,max=160*1024){let n=0;const chunks=[];for await(const c of req){n+=c.length;if(n>max)throw Error('request too large');chunks.push(c);}return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks)));}
 function expireClient(id){const c=clients.get(id);if(!c)return;clients.delete(id);for(const p of clients.values())p.inbox.push({type:'left',id});}
@@ -85,7 +87,7 @@ const adminServer=https.createServer({...tls,minVersion:'TLSv1.3'},(req,res)=>{v
   const file=files[asset],data=await readFile(pathJoin(root,'public',file));
   res.writeHead(200,{...headers,'Content-Type':file.endsWith('.js')?'text/javascript;charset=utf-8':file.endsWith('.css')?'text/css;charset=utf-8':'text/html;charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"});res.end(data);
 })().catch(()=>req.socket.destroy());});
-const listen=s=>new Promise((ok,no)=>{s.once('error',no);s.listen(s===signalServer?port:adminPort,host,ok);});
+const listen=s=>new Promise((ok,no)=>{s.once('error',no);s.listen(s===signalServer?port:adminPort,s===signalServer?host:'127.0.0.1',ok);});
 await listen(signalServer);await listen(adminServer);
 const color={reset:'\x1b[0m',bold:'\x1b[1m',cyan:'\x1b[36m',green:'\x1b[32m',magenta:'\x1b[35m',yellow:'\x1b[33m'};
 const link=u=>`\x1b]8;;${u}\x1b\\${u}\x1b]8;;\x1b\\`;
@@ -93,7 +95,7 @@ function ready(){console.log(`\n${color.bold}${color.green}server is ready!${col
 ready();
 if(config.publicOrigin){const u=new URL(config.publicOrigin);if(u.protocol!=='https:')throw Error('publicOrigin must use HTTPS');publicOrigin=u.origin;ready();}
 else {
-  tunnel=spawn(config.cloudflared??'cloudflared',['tunnel','--no-autoupdate','--url',`https://127.0.0.1:${port}`,'--origin-ca-pool',tls.certPath],{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe']});
+  tunnel=spawn(config.cloudflared??'cloudflared',['tunnel','--no-autoupdate','--url',`https://${tunnelIp}:${port}`,'--origin-ca-pool',tls.certPath],{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe']});
   let tail='';const output=b=>{tail=(tail+b.toString()).slice(-8192);const match=tail.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/);if(match&&!publicOrigin){publicOrigin=match[0];ready();}};tunnel.stdout.on('data',output);tunnel.stderr.on('data',output);
   tunnel.on('error',e=>console.error(`cloudflared を起動できません。config.json の cloudflared を確認してください: ${e.message}`));
   tunnel.on('exit',code=>{publicOrigin=null;if(!closing)console.error(`Quick Tunnel が停止しました (${code})。Node.js を再起動してください。`);});

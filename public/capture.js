@@ -1,4 +1,4 @@
-import { MAX_QUEUE } from './storage.js';
+const MAX_QUEUE=24*1024*1024;
 export const stamp=()=>new Date().toISOString().replace(/[-:]/g,'').replace(/\.\d+Z$/,'Z');
 export function chooseMime(choice='auto'){
   const options={h264:['video/mp4;codecs=avc1.42E033','video/mp4;codecs=avc1.42001f','video/mp4','video/webm;codecs=h264'],vp8:['video/webm;codecs=vp8'],vp9:['video/webm;codecs=vp9'],av1:['video/webm;codecs=av01']};
