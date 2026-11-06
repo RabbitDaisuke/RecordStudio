@@ -14,13 +14,14 @@ const same=(a,b)=>{const x=Buffer.from(String(a)),y=Buffer.from(String(b));retur
 const decode32=s=>{const b=un64(String(s));if(b.length!==32)throw Error('invalid nonce');return b;};
 const configPath=pathJoin(root,'config.json');let config;
 try { config=JSON.parse(await readFile(configPath,'utf8')); } catch(e) { if(e.code==='ENOENT')config=JSON.parse(await readFile(pathJoin(root,'config.example.json'),'utf8'));else throw e; }
-let host;try {host=(await readFile(pathJoin(root,'ip.txt'),'utf8')).trim();}catch{throw Error('ip.txt がありません。このPCの待受用IPv4アドレスをUTF-8で一行指定してください。');}
-if(isIP(host)!==4)throw Error('ip.txt に、このPCの待受用IPv4アドレスをUTF-8で一行指定してください。例: 192.168.1.10');
+let receiverIp;try {receiverIp=(await readFile(pathJoin(root,'ip.txt'),'utf8')).trim();}catch{throw Error('ip.txt がありません。収録クライアントのIPv4アドレスをUTF-8で一行指定してください。');}
+if(isIP(receiverIp)!==4||receiverIp==='0.0.0.0')throw Error('ip.txt に、収録クライアントのIPv4アドレスをUTF-8で一行指定してください。');
+const host='127.0.0.1';
 const port=Number(config.port??9443);if(!Number.isInteger(port)||port<1024||port>65535)throw Error('invalid port');
-const appUrl=new URL(config.appUrl);if(appUrl.protocol!=='https:'||appUrl.username||appUrl.password||appUrl.hash)throw Error('config.appUrl must be HTTPS');
-const allowedOrigins=new Set([appUrl.origin]);for(const o of config.allowedAppOrigins??[]){const u=new URL(o);if(u.protocol!=='https:'||u.origin!==o)throw Error('invalid allowedAppOrigins');allowedOrigins.add(o);}
-const iceServers=config.iceServers??[];if(!Array.isArray(iceServers)||iceServers.length>8)throw Error('invalid iceServers');
-for(const s of iceServers){for(const u of [s.urls].flat()){if(typeof u!=='string'||!/^(stun|stuns|turn|turns):[^\s]+$/.test(u))throw Error('invalid ICE URL');}}
+const appUrl=config.appUrl?new URL(config.appUrl):null;if(appUrl&&(appUrl.protocol!=='https:'||appUrl.username||appUrl.password||appUrl.hash))throw Error('config.appUrl must be HTTPS');
+const allowedOrigins=new Set(appUrl?[appUrl.origin]:[]);for(const o of config.allowedAppOrigins??[]){const u=new URL(o);if(u.protocol!=='https:'||u.origin!==o)throw Error('invalid allowedAppOrigins');allowedOrigins.add(o);}
+if(config.iceServers?.length)throw Error('この構成ではSTUN/TURNを使用しません。config.jsonのiceServersを空にしてください。');
+const iceServers=[];
 const authentication=await persistentAuthentication(pathJoin(root,'.runtime'));
 const token=authentication.token,adminToken=createHash('sha512').update(installationKey(authentication.seed,'local-admin')).digest('hex');
 const tokenBytes=Buffer.from(token,'hex');
@@ -30,10 +31,12 @@ const pending=new Map(),clients=new Map();let publicOrigin=null,tunnel=null,clos
 const budgets=new Map();let globalWindow=Date.now(),globalRequests=0;
 function requester(req){const socketIP=req.socket.remoteAddress??'';const forwarded=req.headers['cf-connecting-ip'];return [host,'127.0.0.1','::1','::ffff:127.0.0.1'].includes(socketIP)&&typeof forwarded==='string'&&isIP(forwarded)?forwarded:socketIP;}
 function budget(req){const now=Date.now();if(now-globalWindow>=10000){globalWindow=now;globalRequests=0;}const id=requester(req);let b=budgets.get(id);if(!b||now-b.at>=10000){if(!b&&budgets.size>=1024)return null;b={at:now,requests:0,failures:0,hellos:0};budgets.set(id,b);}if(++b.requests>300||b.failures>=8)return null;if(++globalRequests>600)return null;return b;}
-const tunnelIp=host==='0.0.0.0'?'127.0.0.1':host;
-const tls=await localCertificate(pathJoin(root,'.runtime'),tunnelIp);const adminPort=port+1;if(adminPort>65535)throw Error('port too high');
+const tunnelIp='127.0.0.1';
+const tls=await localCertificate(pathJoin(root,'.runtime'),'127.0.0.1');const adminPort=port+1;if(adminPort>65535)throw Error('port too high');
 const localOrigin=`https://127.0.0.1:${adminPort}`;
 const headers={'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','Strict-Transport-Security':'max-age=31536000'};
+const assetNames=['index.html','app.js','style.css','camera.html','camera.js','camera.css','crypto.js','signal.js','peer.js','capture.js','storage.js','storage-worker.js','qr.js'];
+const publicAssets=new Map(await Promise.all(assetNames.map(async name=>[name,await readFile(pathJoin(root,'public',name))])));
 const invitationCache=new Map();
 const urlFor=async role=>{if(!publicOrigin)return null;const cacheKey=publicOrigin+'|'+role;if(invitationCache.has(cacheKey))return invitationCache.get(cacheKey);const build=(async()=>{const pair={v:1,u:`${publicOrigin}/${token}`,a:b64(keys[role].a),e:b64(keys[role].e),r:role};const u=new URL(`${publicOrigin}/${token}/connect/${role}`);u.hash='pair='+await wrapPair(pair);return u.href;})();invitationCache.set(cacheKey,build);return build;};
 function json(res,value,cors={}){const body=JSON.stringify(value);res.writeHead(200,{...headers,...cors,'Content-Type':'application/json;charset=utf-8','Content-Length':Buffer.byteLength(body)});res.end(body);}
@@ -55,15 +58,20 @@ const signalServer=https.createServer({...tls,minVersion:'TLSv1.3',maxHeaderSize
   const rate=budget(req);if(!rate){req.socket.destroy();return;}
   const u=new URL(req.url,'https://localhost');const parts=u.pathname.split('/');
   if(!validUrlToken(parts[1])){rate.failures++;req.socket.destroy();return;}
+  if(req.method==='GET'&&parts[2]==='app'){
+    const asset=parts.slice(3).join('/')||'index.html',data=publicAssets.get(asset);if(!data){req.socket.destroy();return;}
+    const type=asset.endsWith('.js')?'text/javascript;charset=utf-8':asset.endsWith('.css')?'text/css;charset=utf-8':'text/html;charset=utf-8';
+    res.writeHead(200,{...headers,'Content-Type':type,'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"});res.end(data);return;
+  }
   if(req.method==='GET'&&parts.length===4&&parts[2]==='connect'&&['sender','receiver'].includes(parts[3])){
-    const target=parts[3]==='sender'?new URL('camera.html',appUrl).href:appUrl.href;
+    const target=appUrl?(parts[3]==='sender'?new URL('camera.html',appUrl).href:appUrl.href):`${publicOrigin}/${token}/app/${parts[3]==='sender'?'camera.html':''}`;
     const script=`const target=new URL(${JSON.stringify(target)});if(!location.hash.startsWith('#pair=rsk2.')){document.getElementById('status').textContent='認証ページの接続URLを開いてください。';}else{target.hash=location.hash;location.replace(target.href);}`;
     const scriptHash=createHash('sha256').update(script).digest('base64');
-    const page=`<!doctype html><html lang="ja"><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>RecordStudio 接続</title><p id="status">接続しています。</p><script>${script}</script></html>`;
-    res.writeHead(200,{...headers,'Content-Type':'text/html;charset=utf-8','Content-Security-Policy':`default-src 'none'; script-src 'sha256-${scriptHash}'; base-uri 'none'; frame-ancestors 'none'`});res.end(page);return;
+    const page=`<!doctype html><html lang="ja"><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><link rel="icon" href="data:,"><title>RecordStudio 接続</title><p id="status">接続しています。</p><script>${script}</script></html>`;
+    res.writeHead(200,{...headers,'Content-Type':'text/html;charset=utf-8','Content-Security-Policy':`default-src 'none'; img-src data:; script-src 'sha256-${scriptHash}'; base-uri 'none'; frame-ancestors 'none'`});res.end(page);return;
   }
   const origin=req.headers.origin;
-  if(!allowedOrigins.has(origin)){req.socket.destroy();return;}
+  if(origin!==publicOrigin&&!allowedOrigins.has(origin)){req.socket.destroy();return;}
   const cors={'Access-Control-Allow-Origin':origin,'Vary':'Origin','Access-Control-Allow-Methods':'POST, OPTIONS','Access-Control-Allow-Headers':'content-type','Access-Control-Max-Age':'600'};
   if(req.method==='OPTIONS'){res.writeHead(204,{...headers,...cors});res.end();return;}
   if(req.method!=='POST'||parts.length!==3){req.socket.destroy();return;}
@@ -82,7 +90,7 @@ const signalServer=https.createServer({...tls,minVersion:'TLSv1.3',maxHeaderSize
     const k=await sessionKeys(keys[s.role].e,s.cn,s.sn),c={id:s.id,role:s.role,k,rx:0,tx:0,inbox:[],at:Date.now(),busy:false};
     for(const peer of clients.values()){if(peer.role!==c.role){boundedPush(peer,{type:'joined',id:c.id,role:c.role});boundedPush(c,{type:'joined',id:peer.id,role:peer.role});}}
     clients.set(c.id,c);
-    const frame=await seal(k.receive,k.receivePrefix,c.tx++,{id:c.id,iceServers,maxCameras:5,...(s.role==='receiver'?{senderUrl:await urlFor('sender')}:{})});json(res,{frame},cors);return;
+    const frame=await seal(k.receive,k.receivePrefix,c.tx++,{id:c.id,iceServers,receiverIp,maxCameras:5,...(s.role==='receiver'?{senderUrl:await urlFor('sender')}:{})});json(res,{frame},cors);return;
   }
   if(parts[2]==='rpc'){
     const c=clients.get(p.id);if(!c||c.busy)throw Error('invalid session');c.busy=true;

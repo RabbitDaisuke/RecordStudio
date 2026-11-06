@@ -1,7 +1,7 @@
 {
   "port": 9443,
-  "appUrl": "https://rabbitdaisuke.github.io/RecordStudio/",
-  "allowedAppOrigins": ["https://recordstudio-rabbit.daisukedaisuke389137.chatgpt.site"],
+  "appUrl": null,
+  "allowedAppOrigins": ["https://rabbitdaisuke.github.io", "https://recordstudio-rabbit.daisukedaisuke389137.chatgpt.site"],
   "cloudflared": "cloudflared",
   "iceServers": []
 }

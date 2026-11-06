@@ -1,6 +1,6 @@
 import { Signal,parseInvitation } from './signal.js';
 import { Peer } from './peer.js';
-import { Storage,LivePreview,downloadFile } from './storage.js';
+import { Storage,downloadFile } from './storage.js';
 import { wrapPair } from './crypto.js';
 import { Capture,openCamera,stamp } from './capture.js';
 import { drawQr } from './qr.js';
@@ -22,7 +22,7 @@ class Studio {
     $('#connect').onclick=()=>this.connect($('#invitation').value).then(()=>{$('#invitation').value='';$('#connect-dialog').close();}).catch(e=>this.notice(e.message,true));
     $('#choose-folder').onclick=()=>$('#folder-dialog').showModal();$('#close-folder').onclick=()=>$('#folder-dialog').close();
     $('#directory').onclick=async()=>{try{const name=await this.storage.choose();$('#destination-label').textContent=name;$('#folder-dialog').close();this.log(`保存先を「${name}」に変更しました。`);}catch(e){if(e.name!=='AbortError')this.notice(e.message,true);}};
-    $('#browser-storage').onclick=async()=>{try{$('#destination-label').textContent=await this.storage.useBrowser();$('#folder-dialog').close();}catch(e){this.notice(e.message,true);}};
+    $('#browser-storage').onclick=async()=>{try{$('#destination-label').textContent=await this.storage.useBrowser();this.browserStorageExplicit=true;$('#folder-dialog').close();}catch(e){this.notice(e.message,true);}};
     $('#record').onclick=()=>this.start().catch(e=>this.notice(e.message,true));$('#stop').onclick=()=>this.stop();
     $('#recover').onclick=()=>this.recover();$('#export-log').onclick=()=>downloadFile(new File([JSON.stringify({version:1,events:this.events,cameras:this.slots.map(s=>({name:s.name,settings:s.settings,state:s.state})),userAgent:navigator.userAgent},null,2)],`RecordStudio-${stamp()}-diagnostics.json`,{type:'application/json'}));
     $('#copy-invitation').onclick=()=>navigator.clipboard.writeText(this.senderUrl).then(()=>this.notice('接続URLをコピーしました。')).catch(e=>this.notice(e.message,true));
@@ -72,14 +72,14 @@ class Studio {
   peerClosed(p){if(p.slot){p.slot.state='fault';this.renderSlot(p.slot);}this.peers.delete(p.id);if(this.phase!=='idle'){this.notice('カメラ端末との接続が切れました。',true);if(this.mode==='sender'){this.slots[0]?.capture?.stop().finally(()=>{this.phase='idle';this.releaseWake();this.update();});}else this.stop('カメラ端末との接続が切れました。');}this.update();}
   async wake(){try{this.wakeLock=await navigator.wakeLock?.request('screen');}catch{}}
   releaseWake(){this.wakeLock?.release().catch(()=>{});this.wakeLock=null;}
-  async start(){if(this.phase!=='idle'||this.mode!=='receiver')return;const slots=this.slots.filter(s=>s.state!=='fault'&&s.settings&&(s.local||s.peer?.channel?.readyState==='open'));if(!slots.length)throw Error('カメラを追加してください。');this.phase='preparing';this.take=`RS_${stamp()}_${crypto.randomUUID().slice(0,6)}`;this.activeSlots=slots;this.takeInfo={version:1,take:this.take,requestedAt:new Date().toISOString(),cameras:[],status:'preparing'};$('#notice').hidden=true;this.update();
+  async start(){if(this.phase!=='idle'||this.mode!=='receiver')return;const slots=this.slots.filter(s=>s.state!=='fault'&&s.settings&&(s.local||s.peer?.channel?.readyState==='open'));if(!slots.length)throw Error('カメラを追加してください。');if(!this.storage.directory&&!this.browserStorageExplicit){if(window.showDirectoryPicker){try{$('#destination-label').textContent=await this.storage.choose();}catch(e){if(e.name==='AbortError')return;throw e;}}else{$('#folder-dialog').showModal();return;}}this.phase='preparing';this.take=`RS_${stamp()}_${crypto.randomUUID().slice(0,6)}`;this.activeSlots=slots;this.takeInfo={version:1,take:this.take,requestedAt:new Date().toISOString(),cameras:[],status:'preparing'};$('#notice').hidden=true;this.update();
     try{
       if(!this.storage.directory)await this.storage.useBrowser();await this.storage.metadata(`${this.take}_started.json`,this.takeInfo);
       const preparations=await Promise.allSettled(slots.map(async(s,i)=>{
         let info;if(s.local){s.capture=new Capture(s.stream,{...this.options(),write:blob=>s.sink.write(blob),onError:e=>{this.notice(e.message,true);this.stop(e.message);}});info={mime:s.capture.mime,settings:s.capture.settings,bitrate:s.capture.bitrate};}else{await s.peer.syncClock();info=await s.peer.request('prepare',{take:this.take});}
         s.bytes=0;s.startBytes=s.peer?.received??0;s.mime=info.mime;s.sink=await this.storage.create(`${this.take}_C${String(i+1).padStart(2,'0')}.${info.mime.includes('mp4')?'mp4':'webm'}`,info.mime);s.failed=false;
         s.info={camera:i+1,name:s.name,local:s.local,filename:s.sink.file.name,mime:info.mime,settings:info.settings,requestedBitrate:info.bitrate,clockOffsetMs:s.peer?.offset??0,clockRoundTripMs:s.peer?.rtt??0};this.takeInfo.cameras.push(s.info);
-        if(!s.local){s.preview?.destroy();s.video.onloadeddata=()=>{s.el.querySelector('.video-placeholder').hidden=true;};s.preview=new LivePreview(s.video,info.mime);s.video.classList.add('playing');s.peer.onBytes=async bytes=>{await s.sink.write(bytes);s.preview.append(bytes);s.bytes=s.sink.file.bytes;};}
+        if(!s.local){s.video.remove();s.el.querySelector('.video-placeholder').textContent='収録データを受信中';s.peer.onBytes=async bytes=>{await s.sink.write(bytes);s.bytes=s.sink.file.bytes;};}
       }));
       const preparationFailure=preparations.find(r=>r.status==='rejected');if(preparationFailure)throw preparationFailure.reason;
       const at=Date.now()+Math.max(1500,...slots.map(s=>(s.peer?.rtt??0)*3));this.startedAt=at;this.takeInfo.scheduledAt=new Date(at).toISOString();this.phase='recording';this.wake();this.update();
