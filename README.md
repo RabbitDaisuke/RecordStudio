@@ -15,7 +15,8 @@ PCのフォルダへ順次書き込む方式と、OPFSへWorkerから書き込�
 映像はカメラごとに別ファイルです。同じ開始時刻を各端末へ予約し、端末間の時計差と実際の開始時刻を記録します。ハードウェアによるフレーム同期は保証しません。
 ## 接続
 Node.jsはTLS 1.3でip.txtに指定したアドレスへ待受します。認証・QRページだけは別ポートの127.0.0.1で待ち受け、Quick Tunnelには公開しません。Quick Tunnelは指定IPのシグナリング用ポートへ接続し、そのIPのSANを含めて生成した証明書をCAとして検証します。
-URLのSHA-512トークン、QRの難読化、起動ごとの認証鍵・暗号鍵、nonceによる相互HMAC認証、方向別HKDF/AES-256-GCMを実装しています。typed-voice-serverとtyped-voiceの添付コードを参照し、RecordStudio用の通信ラベルと役割分離で実装しました。固定QR wrap鍵は公開難読化用で、認証の秘密は起動ごとの鍵です。
+QRとコピーする接続URLは、128桁のSHA-512認証コードを付けたtrycloudflareの接続入口を使います。時刻を種にせず、初回だけOSの暗号学的乱数で1024byteのseedを作り、ローカルの.runtime/authentication.jsonへ保存します。SHA-256はseed整合性の確認に使用し、URL認証コードとは分離します。URLコードと役割別認証鍵・暗号鍵は再起動後も同じseedから復元します。更新時も.runtimeを保持してください。
+typed-voice-serverとtyped-voiceの添付コードを参照し、nonceによる相互HMAC-SHA-256認証、方向別HKDF-SHA-256/AES-256-GCMを実装しています。QRを包む鍵もランダム生成し、共通の秘密鍵や認証情報をコードに埋め込みません。送信クライアントは認証完了後にカメラを有効にします。URLコードは定時間比較し、失敗回数・接続数・認証待ち・リクエスト量を制限します。
 同じネットワーク内での直接通信が標準です。ネットワークを越える場合は`config.json`の`iceServers`へ使用するSTUN/TURNを明示してください。自動で第三者のSTUN/TURNを追加しません。TURNを設定した場合も映像通信はWebRTCのDTLSで暗号化され、Node.jsは中継しません。
 ## 配備
 GitHub Actionsでpublicをdistへビルドし、GitHub Pagesへ配備します。サーバー配布ZIPもArtifactsへ出力します。npmのインストールは行いません。

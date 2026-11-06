@@ -2,14 +2,14 @@ import https from 'node:https';
 import { readFile, mkdir } from 'node:fs/promises';
 import { dirname, join as pathJoin } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHash, timingSafeEqual, randomBytes } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { isIP } from 'node:net';
 import { localCertificate } from './server/tls.mjs';
+import {persistentAuthentication,installationKey} from './server/auth.mjs';
 import { b64, un64, mac, equalProof, random, sessionKeys, proofData, seal, open, wrapPair } from './public/crypto.js';
 
 const root=dirname(fileURLToPath(import.meta.url));
-const shaToken=()=>createHash('sha512').update(randomBytes(64)).digest('hex');
 const same=(a,b)=>{const x=Buffer.from(String(a)),y=Buffer.from(String(b));return x.length===y.length&&timingSafeEqual(x,y);};
 const decode32=s=>{const b=un64(String(s));if(b.length!==32)throw Error('invalid nonce');return b;};
 const configPath=pathJoin(root,'config.json');let config;
@@ -21,14 +21,21 @@ const appUrl=new URL(config.appUrl);if(appUrl.protocol!=='https:'||appUrl.userna
 const allowedOrigins=new Set([appUrl.origin]);for(const o of config.allowedAppOrigins??[]){const u=new URL(o);if(u.protocol!=='https:'||u.origin!==o)throw Error('invalid allowedAppOrigins');allowedOrigins.add(o);}
 const iceServers=config.iceServers??[];if(!Array.isArray(iceServers)||iceServers.length>8)throw Error('invalid iceServers');
 for(const s of iceServers){for(const u of [s.urls].flat()){if(typeof u!=='string'||!/^(stun|stuns|turn|turns):[^\s]+$/.test(u))throw Error('invalid ICE URL');}}
-const token=shaToken(),adminToken=shaToken();
-const keys={receiver:{a:random(32),e:random(32)},sender:{a:random(32),e:random(32)}};
+const authentication=await persistentAuthentication(pathJoin(root,'.runtime'));
+const token=authentication.token,adminToken=createHash('sha512').update(installationKey(authentication.seed,'local-admin')).digest('hex');
+const tokenBytes=Buffer.from(token,'hex');
+const validUrlToken=value=>typeof value==='string'&&/^[a-f0-9]{128}$/.test(value)&&timingSafeEqual(Buffer.from(value,'hex'),tokenBytes);
+const keys=Object.fromEntries(['receiver','sender'].map(role=>[role,{a:installationKey(authentication.seed,role+'/auth'),e:installationKey(authentication.seed,role+'/encryption')}]));
 const pending=new Map(),clients=new Map();let publicOrigin=null,tunnel=null,closing=false;
+const budgets=new Map();let globalWindow=Date.now(),globalRequests=0;
+function requester(req){const socketIP=req.socket.remoteAddress??'';const forwarded=req.headers['cf-connecting-ip'];return [host,'127.0.0.1','::1','::ffff:127.0.0.1'].includes(socketIP)&&typeof forwarded==='string'&&isIP(forwarded)?forwarded:socketIP;}
+function budget(req){const now=Date.now();if(now-globalWindow>=10000){globalWindow=now;globalRequests=0;}const id=requester(req);let b=budgets.get(id);if(!b||now-b.at>=10000){if(!b&&budgets.size>=1024)return null;b={at:now,requests:0,failures:0,hellos:0};budgets.set(id,b);}if(++b.requests>300||b.failures>=8)return null;if(++globalRequests>600)return null;return b;}
 const tunnelIp=host==='0.0.0.0'?'127.0.0.1':host;
 const tls=await localCertificate(pathJoin(root,'.runtime'),tunnelIp);const adminPort=port+1;if(adminPort>65535)throw Error('port too high');
 const localOrigin=`https://127.0.0.1:${adminPort}`;
 const headers={'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','Strict-Transport-Security':'max-age=31536000'};
-const urlFor=async role=>{if(!publicOrigin)return null;const pair={v:1,u:`${publicOrigin}/${token}`,a:b64(keys[role].a),e:b64(keys[role].e),r:role};const u=role==='sender'?new URL('camera.html',appUrl):new URL(appUrl);u.hash='pair='+await wrapPair(pair);return u.href;};
+const invitationCache=new Map();
+const urlFor=async role=>{if(!publicOrigin)return null;const cacheKey=publicOrigin+'|'+role;if(invitationCache.has(cacheKey))return invitationCache.get(cacheKey);const build=(async()=>{const pair={v:1,u:`${publicOrigin}/${token}`,a:b64(keys[role].a),e:b64(keys[role].e),r:role};const u=new URL(`${publicOrigin}/${token}/connect/${role}`);u.hash='pair='+await wrapPair(pair);return u.href;})();invitationCache.set(cacheKey,build);return build;};
 function json(res,value,cors={}){const body=JSON.stringify(value);res.writeHead(200,{...headers,...cors,'Content-Type':'application/json;charset=utf-8','Content-Length':Buffer.byteLength(body)});res.end(body);}
 async function body(req,max=160*1024){let n=0;const chunks=[];for await(const c of req){n+=c.length;if(n>max)throw Error('request too large');chunks.push(c);}return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks)));}
 function expireClient(id){const c=clients.get(id);if(!c)return;clients.delete(id);for(const p of clients.values())p.inbox.push({type:'left',id});}
@@ -44,9 +51,17 @@ function dispatch(c,p){
   }
   throw Error('unknown operation');
 }
-const signalServer=https.createServer({...tls,minVersion:'TLSv1.3'},(req,res)=>{void (async()=>{
+const signalServer=https.createServer({...tls,minVersion:'TLSv1.3',maxHeaderSize:4096,handshakeTimeout:5000},(req,res)=>{void (async()=>{
+  const rate=budget(req);if(!rate){req.socket.destroy();return;}
   const u=new URL(req.url,'https://localhost');const parts=u.pathname.split('/');
-  if(!same(parts[1]??'',token)){req.socket.destroy();return;}
+  if(!validUrlToken(parts[1])){rate.failures++;req.socket.destroy();return;}
+  if(req.method==='GET'&&parts.length===4&&parts[2]==='connect'&&['sender','receiver'].includes(parts[3])){
+    const target=parts[3]==='sender'?new URL('camera.html',appUrl).href:appUrl.href;
+    const script=`const target=new URL(${JSON.stringify(target)});if(!location.hash.startsWith('#pair=rsk2.')){document.getElementById('status').textContent='認証ページの接続URLを開いてください。';}else{target.hash=location.hash;location.replace(target.href);}`;
+    const scriptHash=createHash('sha256').update(script).digest('base64');
+    const page=`<!doctype html><html lang="ja"><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>RecordStudio 接続</title><p id="status">接続しています。</p><script>${script}</script></html>`;
+    res.writeHead(200,{...headers,'Content-Type':'text/html;charset=utf-8','Content-Security-Policy':`default-src 'none'; script-src 'sha256-${scriptHash}'; base-uri 'none'; frame-ancestors 'none'`});res.end(page);return;
+  }
   const origin=req.headers.origin;
   if(!allowedOrigins.has(origin)){req.socket.destroy();return;}
   const cors={'Access-Control-Allow-Origin':origin,'Vary':'Origin','Access-Control-Allow-Methods':'POST, OPTIONS','Access-Control-Allow-Headers':'content-type','Access-Control-Max-Age':'600'};
@@ -54,13 +69,14 @@ const signalServer=https.createServer({...tls,minVersion:'TLSv1.3'},(req,res)=>{
   if(req.method!=='POST'||parts.length!==3){req.socket.destroy();return;}
   const p=await body(req);
   if(parts[2]==='hello'){
+    if(++rate.hellos>8){req.socket.destroy();return;}
     if(pending.size>=32||clients.size>=8)throw Error('room full');const role=p.role;if(!keys[role])throw Error('invalid role');
     const cn=decode32(p.cn),sn=random(32),id=b64(random(16));
     const s={id,role,cn,sn,at:Date.now()};pending.set(id,s);
     json(res,{id,sn:b64(sn),proof:b64(await mac(keys[role].a,proofData(role,cn,sn,'server')))},cors);return;
   }
   if(parts[2]==='auth'){
-    const s=pending.get(p.id);pending.delete(p.id);if(!s||Date.now()-s.at>20000||!await equalProof(keys[s.role].a,proofData(s.role,s.cn,s.sn,'client'),p.proof))throw Error('authentication failed');
+    const s=pending.get(p.id);pending.delete(p.id);if(!s||Date.now()-s.at>20000||!await equalProof(keys[s.role].a,proofData(s.role,s.cn,s.sn,'client'),p.proof)){rate.failures++;throw Error('authentication failed');}
     if(s.role==='receiver'&&[...clients.values()].some(c=>c.role==='receiver'))throw Error('receiver already connected');
     if(s.role==='sender'&&[...clients.values()].filter(c=>c.role==='sender').length>=5)throw Error('five cameras already connected');
     const k=await sessionKeys(keys[s.role].e,s.cn,s.sn),c={id:s.id,role:s.role,k,rx:0,tx:0,inbox:[],at:Date.now(),busy:false};
@@ -74,7 +90,8 @@ const signalServer=https.createServer({...tls,minVersion:'TLSv1.3'},(req,res)=>{
   }
   req.socket.destroy();
 })().catch(()=>req.socket.destroy());});
-signalServer.headersTimeout=10000;signalServer.requestTimeout=15000;signalServer.maxConnections=40;
+signalServer.headersTimeout=5000;signalServer.requestTimeout=12000;signalServer.maxConnections=40;signalServer.keepAliveTimeout=5000;
+signalServer.setTimeout(12000,socket=>socket.destroy());
 signalServer.on('clientError',(_,socket)=>socket.destroy());signalServer.on('upgrade',(_,socket)=>socket.destroy());
 const adminServer=https.createServer({...tls,minVersion:'TLSv1.3'},(req,res)=>{void(async()=>{
   const u=new URL(req.url,localOrigin),segments=u.pathname.split('/');
@@ -91,7 +108,7 @@ const listen=s=>new Promise((ok,no)=>{s.once('error',no);s.listen(s===signalServ
 await listen(signalServer);await listen(adminServer);
 const color={reset:'\x1b[0m',bold:'\x1b[1m',cyan:'\x1b[36m',green:'\x1b[32m',magenta:'\x1b[35m',yellow:'\x1b[33m'};
 const link=u=>`\x1b]8;;${u}\x1b\\${u}\x1b]8;;\x1b\\`;
-function ready(){console.log(`\n${color.bold}${color.green}server is ready!${color.reset}`);const rows=[[color.magenta,'Authentication / QR',`${localOrigin}/${adminToken}/`],[color.cyan,'Studio',null],[color.green,'Handshake',publicOrigin]];for(let i=0;i<rows.length;i++){const [c,label,u]=rows[i];if(u)console.log(`${c}${i===rows.length-1?'└──':'├──'} ${color.bold}${label}${color.reset}: ${c}${link(u)}${color.reset}`);} }
+async function ready(){const rows=[[color.magenta,'Authentication / QR',`${localOrigin}/${adminToken}/`],[color.cyan,'Studio',await urlFor('receiver')],[color.green,'Camera / Handshake',await urlFor('sender')]].filter(([, ,u])=>u);console.log(`\n${color.bold}${color.green}server is ready!${color.reset}`);for(let i=0;i<rows.length;i++){const[c,label,u]=rows[i];console.log(`${c}${i===rows.length-1?'└──':'├──'} ${color.bold}${label}${color.reset}: ${c}${link(u)}${color.reset}`);}}
 ready();
 if(config.publicOrigin){const u=new URL(config.publicOrigin);if(u.protocol!=='https:')throw Error('publicOrigin must use HTTPS');publicOrigin=u.origin;ready();}
 else {
@@ -100,6 +117,6 @@ else {
   tunnel.on('error',e=>console.error(`cloudflared を起動できません。config.json の cloudflared を確認してください: ${e.message}`));
   tunnel.on('exit',code=>{publicOrigin=null;if(!closing)console.error(`Quick Tunnel が停止しました (${code})。Node.js を再起動してください。`);});
 }
-const cleanup=setInterval(()=>{const now=Date.now();for(const[id,p]of pending)if(now-p.at>20000)pending.delete(id);for(const[id,c]of clients)if(now-c.at>30000)expireClient(id);},5000);cleanup.unref();
+const cleanup=setInterval(()=>{const now=Date.now();for(const[id,b]of budgets)if(now-b.at>10000)budgets.delete(id);for(const[id,p]of pending)if(now-p.at>20000)pending.delete(id);for(const[id,c]of clients)if(now-c.at>30000)expireClient(id);},5000);cleanup.unref();
 async function shutdown(){if(closing)return;closing=true;clearInterval(cleanup);tunnel?.kill();signalServer.closeAllConnections();adminServer.closeAllConnections();signalServer.close();adminServer.close();}
 process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);

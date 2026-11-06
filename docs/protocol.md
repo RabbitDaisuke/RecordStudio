@@ -3,12 +3,14 @@
 receiverは収録PCのブラウザ1つ、senderはカメラ端末のブラウザ最大5つ。PC直結カメラと合計で最大5系統。Node.jsは認証・QR・シグナリングだけを担当し、録画データを受け取りません。
 ## 配布と接続先
 GitHub Pages/Sitesは静的publicを配信します。Node.jsの`ip.txt`は必須。このPCの待受用IPv4アドレスを一行指定します。192.168.*などのLANアドレス、127.0.0.1、明示的な0.0.0.0を受け付けます。config.jsonにHTTPSのappUrl、port、cloudflared、iceServersを指定します。許可する追加のUIオリジンはallowedAppOrigins配列で明示します。
-シグナリングTLSは指定IPのport、ローカル認証TLSは127.0.0.1のport+1。Quick Tunnelは指定IPへTLS接続し、証明書SANもそのIPへ追従します。0.0.0.0待受時のトンネル接続先は127.0.0.1。各起動で別々の64byte乱数をSHA-512へ通して128桁hexのURLトークンを生成します。シグナリングURLは`https://<random>.trycloudflare.com/<token>`。ローカル認証URLは`https://127.0.0.1:<port+1>/<admin-token>/`。
+シグナリングTLSは指定IPのport、ローカル認証TLSは127.0.0.1のport+1。Quick Tunnelは指定IPへTLS接続し、証明書SANもそのIPへ追従します。0.0.0.0待受時のトンネル接続先は127.0.0.1。初回だけcrypto.randomBytes(1024)でseedを作り、.runtime/authentication.jsonにseedと整合性確認用SHA-256を保存します。時刻やMath.randomをseedにしません。URL認証コードはSHA-512(seed)の128桁hexです。SHA-256へ短縮しません。既存seedを読み込むのでセッション・プロセス再起動をまたいで同じコードを使います。シグナリングURLは`https://<random>.trycloudflare.com/<token>`。ローカル認証URLは`https://127.0.0.1:<port+1>/<admin-token>/`。Quick Tunnelのホスト名は再起動で変わることがありますが、認証コードは変えません。
 トークン不一致、未許可Origin、未知経路、壊れた認証はNode.jsのrequest.socket.destroy()で切断します。trycloudflareの向こうのクライアントとCloudflare edge間のTCPを、Node.jsから直接強制切断することはできません。Cloudflare側では502等に変換される場合があります。
 ## QRと鍵
-receiver用とsender用に、互いに独立した32byte authKeyと32byte encryptionKeyを起動ごとに生成します。senderの鍵だけではreceiverとして認証できません。
-QRの内容は静的ページURLの`#pair=<wrapped>`。フラグメントはWebサイトへのHTTPリクエストには含まれず、読み取り後にhistoryから消去します。localStorageへ秘密値は保存しません。
-wrapの平文はJSON `{v:1,u:<endpoint>,a:<base64url authKey>,e:<base64url encryptionKey>,r:<role>}`。ランダム12byte IV、AES-256-GCM、AAD `RSKEY1`、16byte tagで包みbase64url化します。固定wrap鍵はtyped-voiceの形式を参考にした難読化であり、秘密保持の根拠にはしません。QRや接続URLを持つ人は、その役割で参加できるため取り扱いは接続キーと同等です。
+receiver用とsender用の32byte authKeyと32byte encryptionKeyは、保存した1024byte seedを鍵とするHMAC-SHA-256と用途別ラベルから復元します。URLへ出すSHA-512値からこれらの鍵を復元することはできません。senderの鍵だけではreceiverとして認証できません。セッションnonceと方向別セッション鍵は接続ごとに生成します。
+QRとコピーする接続URLの内容は`https://<random>.trycloudflare.com/<SHA-512 token>/connect/<role>#pair=rsk2.<key>.<payload>`。QRもURL手動入力も同じ入口を使います。Node.jsがURLトークンを検証後、秘密値を含まない接続HTMLで静的クライアントへ移動します。フラグメントはトンネルや静的サイトへのHTTPリクエストには含まれず、クライアントで読み取った後historyから消去します。localStorageへ秘密値は保存しません。
+payloadの平文はJSON `{v:1,u:<endpoint>,a:<base64url authKey>,e:<base64url encryptionKey>,r:<role>}`。招待ごとにランダム32byte wrap鍵と12byte IVを生成し、AES-256-GCM、AAD `RecordStudio invitation v2`、16byte tagで包みます。wrap鍵も招待のフラグメントに入るため、招待の所持自体が権限です。ソースに共通の秘密鍵や認証コードを埋め込みません。招待は同一公開origin内で固定し、QRを数秒ごとに変更しません。
+URLコードは128桁hexの形式を検査後、64byte同士をtimingSafeEqualで比較します。接続最大40、TLSとHTTPヘッダの期限5秒、要求の期限12秒、ヘッダ4KiB、body160KiB、認証待ち32を上限とします。10秒ごとに送信元300要求・HELLO8件・認証失敗8件、全体600要求までとし、超過時はソケットを切断します。送信元の保持は1024件まで。認証失敗で制限済みの送信元は全体予算を消費させません。これらはNode.js側の資源上限であり、回線規模のDDoSを防げるという保証ではありません。
+送信クライアントはURLトークン付きの経路から得た招待を検証し、相互HMAC認証と暗号化設定応答の検証が成功するまでカメラ起動ボタンと設定を有効にしません。接続先や認証値を埋め込んだ検証用経路は製品に含めません。
 ## 認証
 POST `<endpoint>/hello`へroleと32byte clientNonce。サーバーは20秒有効のランダムsessionId、32byte serverNonce、serverProofを返します。proof入力は`recordstudio/v1/<server|client>\n<role>\n`のUTF-8とclientNonce、serverNonceの連結。HMAC-SHA-256(authKey,input)を相互に検証します。
 POST `<endpoint>/auth`へsessionIdとclientProof。成功時だけ参加を登録し、暗号化された設定を返します。未認証状態の保持は最大32件、認証済み最大8件、receiver1件、sender5件。未認証20秒、認証済み30秒の無通信で破棄します。
